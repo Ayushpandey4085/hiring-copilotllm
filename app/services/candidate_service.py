@@ -1,14 +1,14 @@
 from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import Session
 from ..database.models import Candidate, Screening, Outreach
-from ..llm.ollama_client import OllamaClient
+from ..llm.gemini_client import GeminiClient
 import uuid
 import json
 
 class CandidateService:
     def __init__(self, db: Session):
         self.db = db
-        self.llm = OllamaClient()
+        self.llm = GeminiClient()
 
     def search_candidates(self, query: str, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """Search for candidates based on natural language query"""
@@ -41,21 +41,39 @@ class CandidateService:
         Parse the following recruitment query into structured search criteria:
         "{query}"
         
-        Extract:
-        1. Required skills
-        2. Experience level
-        3. Location preferences
-        4. Employment type
-        5. Any other relevant criteria
+        Provide a JSON response with:
+        1. "required_skills": List of required technical skills
+        2. "experience_level": Experience level (Junior/Mid/Senior/Lead)
+        3. "location": Location preferences
+        4. "employment_type": Employment type (Full-time/Contract/Part-time)
+        5. "domain": Domain/Industry preferences
+        
+        Format your response as valid JSON only.
         """
         
-        response = self.llm.generate_response(prompt)
-        # TODO: Implement proper parsing of LLM response
+        system_prompt = """
+        You are an expert recruitment analyst. Parse natural language job requirements 
+        into structured search criteria. Be precise and extract only the explicitly mentioned requirements.
+        """
+        
+        response = self.llm.generate_response(prompt, system_prompt)
+        
+        try:
+            # Try to parse JSON response
+            import re
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+        except json.JSONDecodeError:
+            pass
+        
+        # Fallback parsing
         return {
-            "skills": [],
-            "experience_level": "",
+            "required_skills": [],
+            "experience_level": "Mid",
             "location": "",
-            "employment_type": ""
+            "employment_type": "Full-time",
+            "domain": ""
         }
 
     def _rank_candidates(self, candidates: List[Candidate], criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -67,14 +85,16 @@ class CandidateService:
                 "name": candidate.name,
                 "skills": candidate.skills,
                 "experience": candidate.experience,
-                "location": candidate.location
+                "location": candidate.location,
+                "education": candidate.education
             }
             
             # Get LLM analysis
             analysis = self.llm.analyze_candidate(candidate_data)
             
             # Update candidate score
-            candidate.score = analysis["fit_score"]
+            fit_score = analysis.get("fit_score", 75)
+            candidate.score = fit_score
             self.db.commit()
             
             ranked.append({
@@ -83,12 +103,37 @@ class CandidateService:
                 "skills": candidate.skills,
                 "experience": candidate.experience,
                 "location": candidate.location,
-                "score": candidate.score
+                "score": fit_score,
+                "analysis": analysis
             })
         
         # Sort by score
         ranked.sort(key=lambda x: x["score"], reverse=True)
         return ranked
+
+    def get_candidate(self, candidate_id: str) -> Dict[str, Any]:
+        """Get detailed candidate information"""
+        candidate = self.db.query(Candidate).filter(Candidate.id == candidate_id).first()
+        if not candidate:
+            raise ValueError(f"Candidate {candidate_id} not found")
+        
+        return {
+            "id": candidate.id,
+            "name": candidate.name,
+            "email": candidate.email,
+            "phone": candidate.phone,
+            "location": candidate.location,
+            "skills": candidate.skills,
+            "experience": candidate.experience,
+            "education": candidate.education,
+            "resume_url": candidate.resume_url,
+            "linkedin_url": candidate.linkedin_url,
+            "github_url": candidate.github_url,
+            "score": candidate.score,
+            "status": candidate.status,
+            "created_at": candidate.created_at.isoformat(),
+            "updated_at": candidate.updated_at.isoformat()
+        }
 
     def screen_candidate(self, candidate_id: str) -> Dict[str, Any]:
         """Perform AI-powered screening of a candidate"""
@@ -99,7 +144,8 @@ class CandidateService:
         # Generate screening questions
         questions = self.llm.generate_screening_questions({
             "skills": candidate.skills,
-            "experience": candidate.experience
+            "experience": candidate.experience,
+            "education": candidate.education
         })
         
         # Create screening record
@@ -124,29 +170,21 @@ class CandidateService:
         if not screening:
             raise ValueError(f"Screening {screening_id} not found")
         
-        # Use LLM to evaluate answers
-        prompt = f"""
-        Evaluate the following screening answers:
-        Questions: {json.dumps(screening.questions)}
-        Answers: {json.dumps(answers)}
-        
-        Provide:
-        1. Score (0-100)
-        2. Detailed feedback
-        3. Areas of strength
-        4. Areas for improvement
-        """
-        
-        evaluation = self.llm.generate_response(prompt)
+        # Use Gemini to evaluate answers
+        evaluation = self.llm.evaluate_screening_answers(screening.questions, answers)
         
         # Update screening record
         screening.answers = answers
-        screening.score = 0.0  # TODO: Extract score from LLM response
-        screening.feedback = evaluation
+        screening.score = evaluation.get("overall_score", 0.0)
+        screening.feedback = evaluation.get("feedback", "")
         self.db.commit()
         
         return {
             "screening_id": screening_id,
-            "score": screening.score,
+            "overall_score": screening.score,
+            "individual_scores": evaluation.get("individual_scores", []),
+            "strengths": evaluation.get("strengths", []),
+            "weaknesses": evaluation.get("weaknesses", []),
+            "recommendation": evaluation.get("recommendation", ""),
             "feedback": screening.feedback
         } 
